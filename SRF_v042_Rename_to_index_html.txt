@@ -1,0 +1,130 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-lAy6kiF5huZT9vf1q/2JTE3VxNFIjn/b7aU8ZuJwXRE='; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'"><meta name="referrer" content="no-referrer"><title>SRF 独立Custodian｜スマートフォン</title><style>body{font:16px system-ui,sans-serif;background:#f6f7fb;color:#162238;margin:0;padding:16px;max-width:700px;margin-inline:auto}h1{font-size:1.45rem}h2{font-size:1.12rem}section{background:white;border:1px solid #dce2ec;border-radius:12px;padding:16px;margin:14px 0}button{width:100%;padding:13px;background:#213c61;color:#fff;border:0;border-radius:8px;margin:7px 0;font-size:1rem}button:disabled{opacity:.4}textarea,input[type=file]{box-sizing:border-box;width:100%;margin:8px 0}textarea{height:100px;border:1px solid #a6b0bb;border-radius:5px;padding:8px;font:12px monospace}label{display:block;margin:9px 0}.note{font-size:14px;color:#515e70}#status{background:#eaf1f9;padding:12px;border-radius:8px;white-space:pre-wrap}</style></head><body>
+<h1>SRF 独立Custodian（スマートフォン版）</h1><p>Ownerとは別の人が、**自分のスマートフォン**で暗号化ファイルのSHAを確認し、受領証へ署名するためのローカル処理画面です。</p><p class="note">公開鍵は渡せますが、秘密鍵は渡しません。この画面から外部への送信は行いません。HTTPSで公開したページを本人のブラウザで開いてください。</p>
+<section><h2>1. Custodian鍵を登録</h2><button id="create">初回のみ：端末内に署名鍵を作成</button><button id="publicBtn">公開鍵JSONを保存</button><textarea id="pub" readonly placeholder="公開鍵と指紋が表示されます"></textarea><p id="state" class="note"></p><p class="note">注意：ブラウザのサイトデータ削除・機種変更で秘密鍵は消失する可能性があります。鍵を失ったら黙って作り直さず、Ownerと失効・再登録をしてください。</p></section>
+<section><h2>2. 暗号化テストファイルの受領証を作成</h2><label>Ownerが送ったChallenge文字列（非秘密）<textarea id="challenge" placeholder="CHALLENGE_TO_PASTE.txt の1行を貼付"></textarea></label><label>受け取った暗号化ファイル（1 MiB以下）<input type="file" id="cipher"></label><label><input type="checkbox" id="cloud"> 自分が管理するクラウドへコピー済み（自己申告：証明済みとは扱わない）</label><label><input type="checkbox" id="consent"> 私はCustodianとして、暗号化テストファイルのハッシュ確認と受領署名に同意します</label><button id="signBtn">ファイルを照合して署名する</button><textarea id="receipt" readonly placeholder="署名済み受領証を表示します"></textarea><button id="receiptBtn">署名済み受領証JSONを保存</button></section>
+<section><h2>3. Ownerに返すもの</h2><p>公開鍵JSONと署名済み受領証JSONだけ。鍵指紋は電話など別の経路でも確認してください。暗号文の復号鍵、Ownerのアカウント、秘密鍵は共有不要です。</p><p class="note">「ファイルをスマホで照合した」ことと「クラウドに保存され、OwnerのPC喪失後にも復元できる」ことは別です。後者には独立ダウンロード・復元試験が必要です。</p></section><div id="status" role="status" aria-live="polite">SRF_SCRIPT_NOT_STARTED：ページを再読み込みしてください。直らない場合はJavaScriptの読み込み制限を確認してください。</div><script>'use strict';
+const srfBootEl=document.getElementById('status');
+if(srfBootEl)srfBootEl.textContent='SRF_SCRIPT_STARTED / IndexedDBを検査中...';
+addEventListener('error',e=>{if(srfBootEl)srfBootEl.textContent='SRF_SCRIPT_ERROR: '+String(e.message||e.error||'UNKNOWN').slice(0,180)});
+addEventListener('unhandledrejection',e=>{if(srfBootEl)srfBootEl.textContent='SRF_PROMISE_ERROR: '+String(e.reason||'UNKNOWN').slice(0,180)});
+
+// SRF Phone Custodian public protocol v0.4. No fetch / network APIs.
+const domain = 'SRF-PHONE-WITNESS/ECDSA-P256/v0.4\0';
+const CHALLENGE = 'srf.phone.challenge.v0.4';
+const PUB = 'srf.phone.public.v0.4';
+const RECEIPT = 'srf.phone.receipt.v0.4';
+const CLAIM = 'srf.phone.signed_claim.v0.4';
+const ATTESTATION = 'PHONE_OBSERVED_CIPHERTEXT_BYTES';
+const MAX_BYTES = 1048576;
+const enc = new TextEncoder();
+function canonical(o) {
+  function walk(v) {
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+      const keys=Object.keys(v).sort();
+      if(keys.some(k=> !/^[a-z_][a-z0-9_]*$/.test(k)))throw Error('KEY_NOT_ASCII');
+      return '{'+keys.map(k=>JSON.stringify(k)+':'+walk(v[k])).join(',')+'}';
+    }
+    if(typeof v==='string' && /^[\x00-\x7f]*$/.test(v))return JSON.stringify(v);
+    if(typeof v==='number' && Number.isSafeInteger(v))return String(v);
+    throw Error('NON_SCALAR_OR_NONASCII');
+  }
+  return walk(o);
+}
+function encode(s) { return enc.encode(s); }
+function fromBytes(bytes) { return new TextDecoder('utf-8',{fatal:true}).decode(bytes); }
+function b64u(bytes) {
+  let s=''; for(const n of bytes)s+=String.fromCharCode(n);
+  return btoa(s).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');
+}
+function unb64u(s) {
+  if (typeof s!=='string' || s.length>8192 || !/^[A-Za-z0-9_-]+$/.test(s)) throw Error('BASE64URL_INVALID');
+  const padded=s.replaceAll('-','+').replaceAll('_','/')+'='.repeat((4-s.length%4)%4);
+  const out=Uint8Array.from(atob(padded), x=>x.charCodeAt(0));
+  if(b64u(out)!==s)throw Error('NONCANONICAL_BASE64URL');
+  return out;
+}
+async function sha(bytes){const h=new Uint8Array(await crypto.subtle.digest('SHA-256',bytes));return Array.from(h,v=>v.toString(16).padStart(2,'0')).join('');}
+async function publicDescriptor(spki){return {schema:PUB,algorithm:'ECDSA-P256-SHA256-P1363',spki_b64u:b64u(new Uint8Array(spki)),fingerprint:'sha256:'+await sha(spki)};}
+function checkChallenge(s) {
+  const raw=fromBytes(unb64u(s));const c=JSON.parse(raw);
+  if(raw!==canonical(c))throw Error('CHALLENGE_NOT_CANONICAL');
+  const f=['schema','scope','challenge_id','nonce','sequence','prev_receipt_sha256','ciphertext_sha256','ciphertext_size_bytes','custodian_fingerprint','created_utc','expires_utc','source_head_sha256'].sort();
+  if(JSON.stringify(Object.keys(c).sort())!==JSON.stringify(f))throw Error('CHALLENGE_FIELDS_INVALID');
+  if(c.schema!==CHALLENGE || c.scope!=='SYNTHETIC_CIPHERTEXT_CUSTODY_ONLY')throw Error('SCOPE_DENIED');
+  if(!/^[0-9a-f]{32}$/.test(c.challenge_id)||!/^[0-9a-f]{32}$/.test(c.nonce))throw Error('NONCE_INVALID');
+  for(const k of ['prev_receipt_sha256','ciphertext_sha256','source_head_sha256']) if(!/^[0-9a-f]{64}$/.test(c[k]))throw Error('DIGEST_INVALID');
+  if(!/^sha256:[0-9a-f]{64}$/.test(c.custodian_fingerprint))throw Error('PIN_INVALID');
+  if(!Number.isSafeInteger(c.sequence)||c.sequence<1||c.sequence>1e6||!Number.isSafeInteger(c.ciphertext_size_bytes)||c.ciphertext_size_bytes<1||c.ciphertext_size_bytes>MAX_BYTES)throw Error('BOUNDS_INVALID');
+  for(const k of ['created_utc','expires_utc'])if(!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(c[k])||!Number.isFinite(Date.parse(c[k])))throw Error('TIME_INVALID');
+  const created=Date.parse(c.created_utc),expires=Date.parse(c.expires_utc),now=Date.now();
+  if(expires-created>86400000||expires<=created||now>expires+120000||now+120000<created)throw Error('EXPIRED_OR_FUTURE');
+  if(c.sequence===1 && c.prev_receipt_sha256!=='0'.repeat(64))throw Error('GENESIS_PREV_INVALID');
+  if(c.sequence>1 && c.prev_receipt_sha256==='0'.repeat(64))throw Error('PREV_REQUIRED');
+  return c;
+}
+async function makeReceipt(privateKey, challengeB64, publicObj, fileBuffer, state={sequence:0,head:'0'.repeat(64)}, storageClaim='PHONE_FILE_ONLY') {
+  const c=checkChallenge(challengeB64);
+  if(c.custodian_fingerprint!==publicObj.fingerprint)throw Error('PIN_WRONG_KEY');
+  if(c.sequence !== state.sequence+1 || c.prev_receipt_sha256!==state.head)throw Error('ROLLBACK_OR_REPLAY_REFUSED');
+  if(storageClaim!=='PHONE_FILE_ONLY'&&storageClaim!=='CLOUD_UPLOAD_SELF_DECLARED')throw Error('STORAGE_CLAIM_INVALID');
+  if(fileBuffer.byteLength!==c.ciphertext_size_bytes || fileBuffer.byteLength>MAX_BYTES || await sha(fileBuffer)!==c.ciphertext_sha256)throw Error('FILE_NOT_SAME_CIPHERTEXT');
+  const claim={schema:CLAIM,challenge_b64u:challengeB64,custodian_fingerprint:publicObj.fingerprint,attestation:ATTESTATION,storage_claim:storageClaim};
+  const data=encode(domain+canonical(claim));
+  const sig = new Uint8Array(await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},privateKey,data));
+  if(sig.length!==64)throw Error('INVALID_P1363_SIGNATURE_LENGTH');
+  const receipt={schema:RECEIPT,claim,signature_b64u:b64u(sig)};
+  return {receipt,receipt_head:await sha(encode(canonical(receipt))),sequence:c.sequence};
+}
+
+const $=id=>document.getElementById(id);
+const DBNAME='srf-phone-custodian-v04';
+function dbOpen(){return new Promise((resolve,reject)=>{
+  let finished=false, req;
+  const timer=setTimeout(()=>finish(null,Error('INDEXEDDB_STARTUP_TIMEOUT_8S')),8000);
+  function finish(value,error){if(finished){if(value)value.close();return;}finished=true;clearTimeout(timer);error?reject(error):resolve(value);}
+  try { req=indexedDB.open(DBNAME,1);
+    req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains('items'))req.result.createObjectStore('items')};
+    req.onsuccess=()=>finish(req.result,null);
+    req.onerror=()=>finish(null,req.error||Error('INDEXEDDB_OPEN_ERROR'));
+    req.onblocked=()=>finish(null,Error('INDEXEDDB_BLOCKED_CLOSE_OTHER_TABS'));
+  }catch(e){finish(null,e)}
+});}
+async function get(name){const db=await dbOpen();return new Promise((ok,no)=>{
+  let finished=false;
+  const timer=setTimeout(()=>finish(null,Error('INDEXEDDB_READ_TIMEOUT_8S')),8000);
+  function finish(value,error){if(finished)return;finished=true;clearTimeout(timer);db.close();error?no(error):ok(value);}
+  try {const tx=db.transaction('items','readonly'),r=tx.objectStore('items').get(name);
+    r.onsuccess=()=>finish(r.result,null);
+    r.onerror=()=>finish(null,r.error||Error('INDEXEDDB_READ_ERROR'));
+    tx.onabort=()=>finish(null,tx.error||Error('INDEXEDDB_TX_ABORT'));
+  }catch(e){finish(null,e)}
+});}
+async function putBatch(entries){const db=await dbOpen();return new Promise((ok,no)=>{const tx=db.transaction('items','readwrite');for(const [k,v] of entries)tx.objectStore('items').put(v,k);tx.oncomplete=()=>{db.close();ok();};tx.onerror=()=>{db.close();no(tx.error);};});}
+function info(msg){$('status').textContent=msg;}
+function download(text,name){const a=document.createElement('a');const url=URL.createObjectURL(new Blob([text],{type:'application/json;charset=utf-8'}));a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),15000);}
+async function doInit(){
+  if(await get('key'))throw Error('KEY_ALREADY_EXISTS_DO_NOT_REGENERATE');
+  const keys=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},false,['sign','verify']);
+  const spki=await crypto.subtle.exportKey('spki',keys.publicKey);
+  const publicObj=await publicDescriptor(spki);
+  await putBatch([['key',keys.privateKey],['public',publicObj],['state',{sequence:0,head:'0'.repeat(64)}]]);
+  $('pub').value=canonical(publicObj);info('鍵をスマートフォン内に生成しました。公開鍵指紋を別経路でOwnerに伝えてください。秘密鍵は送らないでください。');
+}
+async function exportPublic(){const p=await get('public');if(!p)throw Error('GENERATE_KEY_FIRST');$('pub').value=canonical(p);download(canonical(p)+'\n','SRF_PHONE_PUBLIC.json');info('公開鍵ファイル（秘密を含まない）を保存しました。指紋は声など別経路で照合してください。');}
+async function sign(){
+  const key=await get('key'),publicObj=await get('public'),state=await get('state');
+  if(!key||!publicObj||!state)throw Error('NO_KEY_IN_THIS_BROWSER_OR_KEY_LOST');
+  const f=$('cipher').files[0];if(!f)throw Error('SELECT_ENCRYPTED_TEST_FILE');
+  if(f.size>1048576||f.size<1)throw Error('CIPHERTEXT_SIZE_BOUNDS');
+  if(!$('consent').checked)throw Error('CONSENT_REQUIRED');
+  const mode=$('cloud').checked?'CLOUD_UPLOAD_SELF_DECLARED':'PHONE_FILE_ONLY';
+  const r=await makeReceipt(key,$('challenge').value.trim(),publicObj,await f.arrayBuffer(),state,mode);
+  // Updating high-water mark before exposing receipt prevents routine replay after refresh.
+  await putBatch([['state',{sequence:r.sequence,head:r.receipt_head}],['last_receipt',r.receipt]]);
+  $('receipt').value=canonical(r.receipt)+'\n';info('署名成功。暗号文のサイズとSHAが一致。受領証を保存してOwnerに渡してください。クラウドコピーの実在・復元は別途未実証です。');
+}
+async function saveReceipt(){const r=await get('last_receipt');if(!r)throw Error('NO_SIGNED_RECEIPT');download(canonical(r)+'\n','SRF_PHONE_RECEIPT.json');}
+async function refresh(){const p=await get('public'),s=await get('state'),r=await get('last_receipt');$('pub').value=p?canonical(p):'';$('receipt').value=r?canonical(r):'';$('state').textContent=s?`端末側 Sequence: ${s.sequence} / Head: ${s.head}`:'鍵未登録（ブラウザデータを削除すると鍵は失われます）';if($('status').textContent.startsWith('SRF_SCRIPT_STARTED'))info('SRF_READY_LOCAL_ONLY：起動しました。本番認証ではありません。');}
+async function wrap(fn){try{await fn();await refresh();}catch(e){info('拒否: '+(e?.message||String(e)).slice(0,150));}}
+if(!globalThis.isSecureContext||!crypto?.subtle||!globalThis.indexedDB){info('HTTPS/安全なコンテキストまたはWebCrypto/IndexedDBがありません。処理を停止します。');for(const id of ['create','publicBtn','signBtn','receiptBtn'])$(id).disabled=true;}else{for(const [id,fn] of [['create',doInit],['publicBtn',exportPublic],['signBtn',sign],['receiptBtn',saveReceipt]])$(id).addEventListener('click',()=>wrap(fn));wrap(refresh);}
+</script></body></html>
